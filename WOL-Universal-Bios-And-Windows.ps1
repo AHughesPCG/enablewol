@@ -91,7 +91,8 @@ function Enable-BiosWolLenovo {
                 Write-Log "[Lenovo] Failed to set $val. Return code: $($result.Return)"
             }
         } catch {
-            Write-Log "[Lenovo] Exception while setting $val: $($_.Exception.Message)"
+            # FIXED LINE
+            Write-Log ("[Lenovo] Exception while setting {0}: {1}" -f $val, $_.Exception.Message)
         }
     }
 
@@ -332,3 +333,4 @@ try {
 
 Write-Log "========== WOL Universal BIOS + Windows Config Complete =========="
 Write-Host "Done. Check C:\Logs\WOL-Universal.log"
+
