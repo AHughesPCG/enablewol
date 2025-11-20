@@ -1,14 +1,23 @@
 <# 
     WOL-Universal-Bios-And-Windows.ps1
 
-    1. Detects vendor and model
-    2. Attempts to enable Wake on LAN in BIOS on supported systems
+    1. Ensures local PartnersCG admin account exists:
+       - Username: partnersadmin
+       - Local admin group membership
+       - If created, prints and logs the password
+
+    2. Detects vendor and model
+
+    3. Attempts to enable Wake on LAN in BIOS on supported systems
        - Lenovo (ThinkCentre, ThinkPad, ThinkStation) via Lenovo WMI
        - Dell with DCIM BIOS WMI
        - HP with Instrumented BIOS WMI
-    3. Configures Windows side WOL for all physical NICs
-    4. Disables Fast Startup
-    5. Logs everything to C:\Logs\WOL-Universal.log
+
+    4. Configures Windows side WOL for all physical NICs
+
+    5. Disables Fast Startup
+
+    6. Logs everything to C:\Logs\WOL-Universal.log
 #>
 
 # Must be admin
@@ -32,7 +41,66 @@ function Write-Log {
 
 Write-Log "========== Starting WOL Universal BIOS + Windows Config =========="
 
-# Detect system
+# --------------------------------------------------------------------
+# 0. Ensure partnersadmin local admin account exists
+# --------------------------------------------------------------------
+Write-Log "[Account] Checking for local account 'partnersadmin'"
+
+try {
+    Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue | Out-Null
+} catch { }
+
+$partnerUser = $null
+try {
+    $partnerUser = Get-LocalUser -Name "partnersadmin" -ErrorAction SilentlyContinue
+} catch {
+    Write-Log "[Account] Get-LocalUser not available: $($_.Exception.Message)"
+}
+
+$genericPasswordPlain = "P@rtner5!W0L"   # You can change this later if you want
+$genericPassword = ConvertTo-SecureString $genericPasswordPlain -AsPlainText -Force
+
+if (-not $partnerUser) {
+    Write-Log "[Account] 'partnersadmin' does not exist. Creating account."
+    try {
+        $partnerUser = New-LocalUser -Name "partnersadmin" -Password $genericPassword -PasswordNeverExpires:$true -UserMayNotChangePassword:$false -AccountNeverExpires:$true
+        Write-Log "[Account] Created local user 'partnersadmin' with default password."
+        Write-Host "Created local admin account: partnersadmin / $genericPasswordPlain"
+    } catch {
+        Write-Log "[Account] FAILED to create 'partnersadmin': $($_.Exception.Message)"
+    }
+} else {
+    Write-Log "[Account] 'partnersadmin' already exists."
+    if (-not $partnerUser.Enabled) {
+        try {
+            Enable-LocalUser -Name "partnersadmin"
+            Write-Log "[Account] Enabled 'partnersadmin' account."
+        } catch {
+            Write-Log "[Account] FAILED to enable 'partnersadmin': $($_.Exception.Message)"
+        }
+    }
+}
+
+# Make sure partnersadmin is local admin
+try {
+    $isAdmin = (Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\partnersadmin" })
+    if (-not $isAdmin) {
+        Add-LocalGroupMember -Group "Administrators" -Member "partnersadmin" -ErrorAction Stop
+        Write-Log "[Account] Added 'partnersadmin' to local Administrators group."
+    } else {
+        Write-Log "[Account] 'partnersadmin' is already in local Administrators group."
+    }
+} catch {
+    Write-Log "[Account] FAILED to ensure 'partnersadmin' is local admin: $($_.Exception.Message)"
+}
+
+# NOTE: Script continues running as the current admin context.
+# If you ever want to explicitly re-run under partnersadmin, you can
+# do that from your RMM / ScreenConnect using those credentials.
+
+# --------------------------------------------------------------------
+# 1. Detect system vendor/model
+# --------------------------------------------------------------------
 try {
     $cs = Get-CimInstance Win32_ComputerSystem
     $bios = Get-CimInstance Win32_BIOS
@@ -45,7 +113,15 @@ try {
     Write-Log "Failed to read basic system information: $($_.Exception.Message)"
 }
 
-# 1. BIOS side functions
+# Mini PC / Beelink-style detection hint
+if ($vendor -match "Micro Computer" -or $vendor -match "Beelink" -or $model -match "Venus" -or $model -match "Mini PC") {
+    Write-Log "[MiniPC] Detected small form factor / white-label board. These often DO NOT support WOL from full shutdown (S5) even when Windows and NIC are configured."
+    Write-Log "[MiniPC] Expect WOL from SLEEP to work, but WOL from SHUTDOWN may be blocked by firmware (no NIC standby power, ErP-like behavior)."
+}
+
+# --------------------------------------------------------------------
+# 2. BIOS-side helper functions
+# --------------------------------------------------------------------
 function Enable-BiosWolLenovo {
     Write-Log "[Lenovo] Attempting Lenovo BIOS WMI WOL enable"
 
@@ -91,7 +167,6 @@ function Enable-BiosWolLenovo {
                 Write-Log "[Lenovo] Failed to set $val. Return code: $($result.Return)"
             }
         } catch {
-            # FIXED LINE
             Write-Log ("[Lenovo] Exception while setting {0}: {1}" -f $val, $_.Exception.Message)
         }
     }
@@ -132,15 +207,14 @@ function Enable-BiosWolDell {
     }
 
     if (-not $wolAttr) {
-        Write-Log "[Dell] No WakeOnLan like attribute found in DCIM_BIOSEnumeration."
+        Write-Log "[Dell] No WakeOnLan-like attribute found in DCIM_BIOSEnumeration."
         return
     }
 
     foreach ($attr in $wolAttr) {
-        Write-Log "[Dell] Found WOL attribute: $($attr.AttributeName). Current possible values: $($attr.PossibleValues -join ', ')"
+        Write-Log "[Dell] Found WOL attribute: $($attr.AttributeName). Possible values: $($attr.PossibleValues -join ', ')"
     }
 
-    # Try to set first attribute to "Enabled" if that is allowed
     $target = $wolAttr | Select-Object -First 1
     $valueToSet = $null
 
@@ -158,7 +232,6 @@ function Enable-BiosWolDell {
     }
 
     try {
-        # Dell DCIM_BIOSService usually exposes SetBIOSAttributes with arrays
         $attrNames  = @($target.AttributeName)
         $attrValues = @($valueToSet)
         $result = $biosService.SetBIOSAttributes($attrNames, $attrValues)
@@ -193,7 +266,6 @@ function Enable-BiosWolHP {
         Write-Log "[HP] No WakeOnLAN setting found in HP BIOS settings."
     }
 
-    # Try common HP values
     $targetValues = @(
         "WakeOnLAN,Enable",
         "WakeOnLAN,Enabled",
@@ -232,7 +304,9 @@ function Enable-BiosWolHP {
     }
 }
 
-# 2. Call vendor specific BIOS functions
+# --------------------------------------------------------------------
+# 3. Call vendor specific BIOS functions (if supported)
+# --------------------------------------------------------------------
 if ($vendor -match "Lenovo") {
     Enable-BiosWolLenovo
 } elseif ($vendor -match "Dell") {
@@ -243,8 +317,9 @@ if ($vendor -match "Lenovo") {
     Write-Log "[Generic] Vendor not recognized as Lenovo, Dell, or HP. BIOS WOL change skipped."
 }
 
-# 3. Windows side WOL config
-
+# --------------------------------------------------------------------
+# 4. Windows side WOL config
+# --------------------------------------------------------------------
 Write-Log "[Windows] Disabling Fast Startup"
 try {
     powercfg -h off
@@ -333,4 +408,4 @@ try {
 
 Write-Log "========== WOL Universal BIOS + Windows Config Complete =========="
 Write-Host "Done. Check C:\Logs\WOL-Universal.log"
-
+Write-Host "If 'partnersadmin' was created, default password is: $genericPasswordPlain"
